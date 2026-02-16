@@ -10,6 +10,7 @@ import time
 import os
 import logging
 import gc
+import asyncio
 from starlette.concurrency import run_in_threadpool
 
 router = APIRouter(prefix="/image", tags=["images"])
@@ -20,8 +21,12 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
 # Ajustes para 512MB
-MAX_SIDE = int(os.getenv("MAX_SIDE", "1024"))          # 1024 recomendado
+MAX_SIDE = int(os.getenv("MAX_SIDE", "1024"))          # 768/1024 recomendado
 MAX_PIXELS = int(os.getenv("MAX_PIXELS", "1500000"))   # 1.5MP recomendado
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "85"))    # 80-88 suele ir bien
+
+# 🔥 clave en 512MB: evita concurrencia
+SEM = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENCY", "1")))
 
 
 async def _read_upload_bytes(upload: UploadFile) -> bytes:
@@ -43,6 +48,7 @@ async def _read_upload_bytes(upload: UploadFile) -> bytes:
 def _downscale_before_rembg(inp: bytes) -> bytes:
     """
     Reduce resolución ANTES de rembg para ahorrar RAM.
+    Exporta a JPEG (más ligero de codificar que PNG en muchos casos).
     """
     im = Image.open(io.BytesIO(inp))
     im = ImageOps.exif_transpose(im)  # respeta orientación móvil
@@ -51,9 +57,8 @@ def _downscale_before_rembg(inp: bytes) -> bytes:
     if (w * h) > MAX_PIXELS or max(w, h) > MAX_SIDE:
         im.thumbnail((MAX_SIDE, MAX_SIDE), Image.LANCZOS)
 
-    # rembg suele ir bien con PNG; si quieres aún menos RAM: JPEG quality=90
     buf = io.BytesIO()
-    im.convert("RGB").save(buf, format="PNG", optimize=True)
+    im.convert("RGB").save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
     im.close()
     return buf.getvalue()
 
@@ -90,6 +95,7 @@ def _square_and_resize(img_rgba: Image.Image, size: int, y_bias: float = 0.12) -
     ox = (side - img_rgba.width) // 2
     oy = (side - img_rgba.height) // 2
 
+    # sube el sujeto (mejor avatar)
     oy = int(oy - side * y_bias)
     oy = max(min(oy, side - img_rgba.height), 0)
 
@@ -105,68 +111,73 @@ def _to_png_bytes(img_rgba: Image.Image) -> bytes:
 
 @router.post("/profile-bundle")
 async def profile_bundle(file: UploadFile = File(...)):
-    t0 = time.time()
-    inp = out_png = None
-    img = img512 = img92 = None
+    async with SEM:
+        t0 = time.time()
+        inp = out_png = None
+        img = img512 = img92 = None
 
-    try:
-        inp = await _read_upload_bytes(file)
-
-        # 🔥 clave para 512MB: reducir antes de rembg
-        inp = await run_in_threadpool(_downscale_before_rembg, inp)
-
-        if DEBUG_LOGS:
-            logger.info("downscale_ok bytes=%s", len(inp))
-
-        # rembg en threadpool
-        out_png = await run_in_threadpool(remove, inp)
-        if not out_png or len(out_png) < 100:
-            raise HTTPException(status_code=500, detail="rembg devolvió salida vacía")
-
-        img = Image.open(io.BytesIO(out_png)).convert("RGBA")
-
-        # limpiar halos + crop
-        img = _clean_alpha(img, cutoff=8)
-        img = _crop_to_subject_rgba(img, padding_ratio=0.18, alpha_threshold=10)
-
-        # sizes
-        img512 = _square_and_resize(img, size=512, y_bias=0.10)
-        img92 = _square_and_resize(img, size=92, y_bias=0.14)
-
-        png512 = _to_png_bytes(img512)
-        png92 = _to_png_bytes(img92)
-
-        zbuf = io.BytesIO()
-        with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            z.writestr("profile_512.png", png512)
-            z.writestr("profile_92.png", png92)
-
-        zip_bytes = zbuf.getvalue()
-
-        if DEBUG_LOGS:
-            logger.info("zip_ok bytes=%s total=%ss", len(zip_bytes), round(time.time() - t0, 3))
-
-        return Response(content=zip_bytes, media_type="application/zip")
-
-    except HTTPException:
-        raise
-
-    except Exception as e:
-        logger.error("[profile-bundle] ERROR: %r", e)
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Error procesando la imagen")
-
-    finally:
-        # liberar memoria agresivo (importante en 512MB)
         try:
-            if img: img.close()
-            if img512: img512.close()
-            if img92: img92.close()
-        except Exception:
-            pass
-        inp = None
-        out_png = None
-        img = None
-        img512 = None
-        img92 = None
-        gc.collect()
+            inp = await _read_upload_bytes(file)
+
+            # 🔥 clave: reducir antes de rembg (en threadpool)
+            inp = await run_in_threadpool(_downscale_before_rembg, inp)
+
+            if DEBUG_LOGS:
+                logger.info("downscale_ok bytes=%s", len(inp))
+
+            # rembg (pesado) en threadpool
+            out_png = await run_in_threadpool(remove, inp)
+            if not out_png or len(out_png) < 100:
+                raise HTTPException(status_code=500, detail="rembg devolvió salida vacía")
+
+            img = Image.open(io.BytesIO(out_png)).convert("RGBA")
+
+            # limpiar halos + crop
+            img = _clean_alpha(img, cutoff=8)
+            img = _crop_to_subject_rgba(img, padding_ratio=0.18, alpha_threshold=10)
+
+            # sizes
+            img512 = _square_and_resize(img, size=512, y_bias=0.10)
+            img92 = _square_and_resize(img, size=92, y_bias=0.14)
+
+            png512 = _to_png_bytes(img512)
+            png92 = _to_png_bytes(img92)
+
+            zbuf = io.BytesIO()
+            with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                z.writestr("profile_512.png", png512)
+                z.writestr("profile_92.png", png92)
+
+            zip_bytes = zbuf.getvalue()
+
+            if DEBUG_LOGS:
+                logger.info("zip_ok bytes=%s total=%ss", len(zip_bytes), round(time.time() - t0, 3))
+
+            return Response(
+                content=zip_bytes,
+                media_type="application/zip",
+                headers={"Cache-Control": "no-store"}
+            )
+
+        except HTTPException:
+            raise
+
+        except Exception as e:
+            logger.error("[profile-bundle] ERROR: %r", e)
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail="Error procesando la imagen")
+
+        finally:
+            # liberar memoria agresivo (importante en 512MB)
+            try:
+                if img: img.close()
+                if img512: img512.close()
+                if img92: img92.close()
+            except Exception:
+                pass
+            inp = None
+            out_png = None
+            img = None
+            img512 = None
+            img92 = None
+            gc.collect()
