@@ -2,22 +2,26 @@ from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import Response
 from core.config import MAX_BYTES
 from rembg import remove
-from PIL import Image
+from PIL import Image, ImageOps
 import io
 import zipfile
 import traceback
 import time
 import os
 import logging
+import gc
 from starlette.concurrency import run_in_threadpool
 
 router = APIRouter(prefix="/image", tags=["images"])
 
 DEBUG_LOGS = os.getenv("DEBUG_LOGS", "0") in ("1", "true", "True", "yes", "YES")
-
 logger = logging.getLogger("tools-service.image")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
+
+# Ajustes para 512MB
+MAX_SIDE = int(os.getenv("MAX_SIDE", "1024"))          # 1024 recomendado
+MAX_PIXELS = int(os.getenv("MAX_PIXELS", "1500000"))   # 1.5MP recomendado
 
 
 async def _read_upload_bytes(upload: UploadFile) -> bytes:
@@ -29,7 +33,6 @@ async def _read_upload_bytes(upload: UploadFile) -> bytes:
         raise HTTPException(status_code=400, detail=f"Formato no permitido: {ct}. Usa JPG/PNG/WEBP")
 
     data = await upload.read()
-
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
     if len(data) > MAX_BYTES:
@@ -37,48 +40,31 @@ async def _read_upload_bytes(upload: UploadFile) -> bytes:
     return data
 
 
-def _pre_square_crop_rgb(img: Image.Image, y_bias: float = 0.08) -> Image.Image:
+def _downscale_before_rembg(inp: bytes) -> bytes:
     """
-    Recorta ANTES de rembg a cuadrado (sin transparencia).
-    y_bias > 0 sube un poco el encuadre para que no corte cabeza.
+    Reduce resolución ANTES de rembg para ahorrar RAM.
     """
-    img = img.convert("RGB")
-    w, h = img.size
-    side = min(w, h)
+    im = Image.open(io.BytesIO(inp))
+    im = ImageOps.exif_transpose(im)  # respeta orientación móvil
+    w, h = im.size
 
-    # centro base
-    cx = w // 2
-    cy = h // 2
+    if (w * h) > MAX_PIXELS or max(w, h) > MAX_SIDE:
+        im.thumbnail((MAX_SIDE, MAX_SIDE), Image.LANCZOS)
 
-    # sube el centro un pelín (mejor retratos)
-    cy = int(cy - h * y_bias)
-
-    left = max(0, cx - side // 2)
-    top = max(0, cy - side // 2)
-
-    # ajusta para no salirte
-    if left + side > w:
-        left = w - side
-    if top + side > h:
-        top = h - side
-
-    return img.crop((left, top, left + side, top + side))
+    # rembg suele ir bien con PNG; si quieres aún menos RAM: JPEG quality=90
+    buf = io.BytesIO()
+    im.convert("RGB").save(buf, format="PNG", optimize=True)
+    im.close()
+    return buf.getvalue()
 
 
-def _clean_alpha(img_rgba: Image.Image, cutoff: int = 24) -> Image.Image:
-    """
-    Elimina alpha muy bajo (halos) -> 0.
-    cutoff más alto = bbox más "apretado".
-    """
+def _clean_alpha(img_rgba: Image.Image, cutoff: int = 8) -> Image.Image:
     r, g, b, a = img_rgba.split()
     a = a.point(lambda p: 0 if p < cutoff else p)
     return Image.merge("RGBA", (r, g, b, a))
 
 
-def _crop_to_subject_rgba(img_rgba: Image.Image, padding_ratio: float = 0.10, alpha_threshold: int = 40) -> Image.Image:
-    """
-    bbox del sujeto usando alpha_threshold alto para ignorar halos.
-    """
+def _crop_to_subject_rgba(img_rgba: Image.Image, padding_ratio: float = 0.18, alpha_threshold: int = 10) -> Image.Image:
     alpha = img_rgba.split()[-1]
     mask = alpha.point(lambda p: 255 if p > alpha_threshold else 0)
     bbox = mask.getbbox()
@@ -97,14 +83,16 @@ def _crop_to_subject_rgba(img_rgba: Image.Image, padding_ratio: float = 0.10, al
     return img_rgba.crop((x0, y0, x1, y1))
 
 
-def _square_and_resize(img_rgba: Image.Image, size: int) -> Image.Image:
-    """
-    Cuadrado + resize SIN y_bias (para evitar el hueco abajo).
-    """
+def _square_and_resize(img_rgba: Image.Image, size: int, y_bias: float = 0.12) -> Image.Image:
     side = max(img_rgba.width, img_rgba.height)
     canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+
     ox = (side - img_rgba.width) // 2
     oy = (side - img_rgba.height) // 2
+
+    oy = int(oy - side * y_bias)
+    oy = max(min(oy, side - img_rgba.height), 0)
+
     canvas.paste(img_rgba, (ox, oy), img_rgba)
     return canvas.resize((size, size), Image.LANCZOS)
 
@@ -117,59 +105,68 @@ def _to_png_bytes(img_rgba: Image.Image) -> bytes:
 
 @router.post("/profile-bundle")
 async def profile_bundle(file: UploadFile = File(...)):
-    """
-    ZIP con:
-      - profile_512.png
-      - profile_96.png   (compat con tu back Node)
-    """
     t0 = time.time()
+    inp = out_png = None
+    img = img512 = img92 = None
 
     try:
         inp = await _read_upload_bytes(file)
 
-        # A) pre-crop cuadrado ANTES de rembg
-        orig = Image.open(io.BytesIO(inp))
-        pre = _pre_square_crop_rgb(orig, y_bias=0.08)
+        # 🔥 clave para 512MB: reducir antes de rembg
+        inp = await run_in_threadpool(_downscale_before_rembg, inp)
 
-        pre_buf = io.BytesIO()
-        pre.save(pre_buf, format="PNG")  # PNG para pasar a rembg consistente
-        pre_bytes = pre_buf.getvalue()
+        if DEBUG_LOGS:
+            logger.info("downscale_ok bytes=%s", len(inp))
 
-        # B) rembg en threadpool (mejor calidad con alpha_matting)
-        # (si ves que tarda mucho, quita alpha_matting=True)
-        out_png = await run_in_threadpool(
-            remove,
-            pre_bytes,
-            alpha_matting=True,
-            alpha_matting_foreground_threshold=240,
-            alpha_matting_background_threshold=10,
-            alpha_matting_erode_size=10,
-        )
+        # rembg en threadpool
+        out_png = await run_in_threadpool(remove, inp)
         if not out_png or len(out_png) < 100:
             raise HTTPException(status_code=500, detail="rembg devolvió salida vacía")
 
-        # C) RGBA
         img = Image.open(io.BytesIO(out_png)).convert("RGBA")
 
-        # D) limpia halos + recorta bien al sujeto
-        img = _clean_alpha(img, cutoff=24)
-        img = _crop_to_subject_rgba(img, padding_ratio=0.10, alpha_threshold=40)
+        # limpiar halos + crop
+        img = _clean_alpha(img, cutoff=8)
+        img = _crop_to_subject_rgba(img, padding_ratio=0.18, alpha_threshold=10)
 
-        # E) cuadrados finales
-        img512 = _square_and_resize(img, 512)
-        img96 = _square_and_resize(img, 96)
+        # sizes
+        img512 = _square_and_resize(img, size=512, y_bias=0.10)
+        img92 = _square_and_resize(img, size=92, y_bias=0.14)
 
-        # F) zip
+        png512 = _to_png_bytes(img512)
+        png92 = _to_png_bytes(img92)
+
         zbuf = io.BytesIO()
         with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-            z.writestr("profile_512.png", _to_png_bytes(img512))
-            z.writestr("profile_96.png", _to_png_bytes(img96))
+            z.writestr("profile_512.png", png512)
+            z.writestr("profile_92.png", png92)
 
-        return Response(content=zbuf.getvalue(), media_type="application/zip")
+        zip_bytes = zbuf.getvalue()
+
+        if DEBUG_LOGS:
+            logger.info("zip_ok bytes=%s total=%ss", len(zip_bytes), round(time.time() - t0, 3))
+
+        return Response(content=zip_bytes, media_type="application/zip")
 
     except HTTPException:
         raise
+
     except Exception as e:
         logger.error("[profile-bundle] ERROR: %r", e)
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Error procesando la imagen")
+
+    finally:
+        # liberar memoria agresivo (importante en 512MB)
+        try:
+            if img: img.close()
+            if img512: img512.close()
+            if img92: img92.close()
+        except Exception:
+            pass
+        inp = None
+        out_png = None
+        img = None
+        img512 = None
+        img92 = None
+        gc.collect()
