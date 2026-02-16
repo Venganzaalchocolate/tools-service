@@ -2,27 +2,28 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    # fuerza CPU (evita intentos raros de GPU)
-    CUDA_VISIBLE_DEVICES=-1 \
-    # ruta estándar donde rembg busca el modelo
-    U2NET_HOME=/root/.u2net
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    VECLIB_MAXIMUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    REMBG_MODEL=u2netp \
+    REMBG_CONCURRENCY=1 \
+    MAX_SIDE=768 \
+    MAX_PIXELS=900000
 
 WORKDIR /app
 
-# deps sistema: curl para bajar el modelo en build-time
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    curl \
   && rm -rf /var/lib/apt/lists/*
-
-# 🔥 Descarga el modelo en build-time para evitar bajarlo al arrancar (y evitar picos RAM)
-RUN mkdir -p /root/.u2net \
- && curl -L -o /root/.u2net/u2net.onnx \
-    https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 🔥 descarga/cache del modelo en build (evita el log de “Downloading ... u2net.onnx” en runtime)
+RUN python -c "from rembg.session_factory import new_session; new_session('u2netp')"
+
 COPY . .
 
-CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
